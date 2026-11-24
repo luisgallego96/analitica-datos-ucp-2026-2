@@ -1,219 +1,358 @@
-from dash import Dash, html, dcc, callback, Output, Input
-import plotly.express as px
+
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
-import numpy as np
-import plotly
 import plotly.express as px
 import plotly.graph_objects as go
 
+from dash import Dash, dcc, html, Input, Output, callback
+from sqlalchemy import text
 
-app = Dash()
-rng = np.random.default_rng(42)
-catalogo = pd.DataFrame([
-    ("Portátil", "Equipos", 2400000, 1980000),
-    ("Teléfono", "Equipos", 1500000, 1125000),
-    ("Tableta", "Equipos", 1100000, 770000),
-    ("Monitor", "Equipos", 850000, 552500),
-    ("Teclado", "Accesorios", 130000, 65000),
-    ("Mouse", "Accesorios", 80000, 32000),
-    ("Audífonos", "Accesorios", 180000, 81000),
-    ("Webcam", "Accesorios", 200000, 100000),
-], columns=["producto", "categoria", "precio_unitario", "costo_unitario"])
-registros = []
-for fecha in pd.date_range("2024-11-01", "2026-10-31"):
-    mes = (fecha.year - 2024) * 12 + fecha.month - 11
-    for canal in ["Tienda", "Web"]:
-        # En Web crecen las operaciones y aumentan las rebajas durante el período.
-        estacionalidad = 1.3 if fecha.month in [11, 12] else 1.0
-        cantidad = int(rng.poisson((4 + mes * (0.22 if canal == "Web" else 0.07)) * estacionalidad))
-        for _ in range(cantidad):
-            producto = catalogo.iloc[int(rng.integers(len(catalogo)))]
-            descuento = int(rng.choice([0, 5, 10]))
-            if canal == "Web":
-                descuento += min(mes // 4, 5)
-            registros.append({
-                "fecha": fecha, "canal": canal,
-                **producto.to_dict(), "unidades": int(rng.integers(1, 4)),
-                "descuento_pct": descuento
-            })
-ventas = pd.DataFrame(registros)
-ventas.insert(0, "venta_id", [f"V{i:05d}" for i in range(1, len(ventas) + 1)])
+from database import engine
 
-ventas["venta_neta"] = ventas["unidades"] * ventas["precio_unitario"] * (1 - ventas["descuento_pct"] / 100)
-ventas["cogs"] = ventas["unidades"] * ventas["costo_unitario"]
-ventas["utilidad_bruta"] = ventas["venta_neta"] - ventas["cogs"]
-ventas["mes"] = ventas["fecha"].dt.to_period("M").dt.to_timestamp()
-MESES = pd.date_range(ventas["mes"].min(), ventas["mes"].max(), freq="MS")
-CANALES = ["Todos", "Tienda", "Web"]
-PERIODO = "Noviembre 2024–octubre 2026"
 
-mensual_canal = ventas.groupby(["mes", "canal"], as_index=False)[["venta_neta", "utilidad_bruta"]].sum()
-mensual_canal["margen_pct"] = 100 * mensual_canal["utilidad_bruta"] / mensual_canal["venta_neta"]
+app = Dash(__name__)
+app.title = "Monitor de Servicios"
 
-def filtrar(datos, canal="Todos", inicio=None, fin=None):
-    seleccion = datos.copy()
-    if canal != "Todos":
-        seleccion = seleccion.loc[seleccion["canal"].eq(canal)]
-    if inicio is not None:
-        seleccion = seleccion.loc[seleccion["fecha"] >= pd.Timestamp(inicio)]
-    if fin is not None:
-        limite = pd.Timestamp(fin) + pd.offsets.MonthBegin(1)
-        seleccion = seleccion.loc[seleccion["fecha"] < limite]
-    return seleccion.copy()
 
-def resumir(datos, meses=None):
-    if meses is None:
-        meses = MESES
-    ingresos = datos["venta_neta"].sum()
-    utilidad = datos["utilidad_bruta"].sum()
-    margen = 100 * utilidad / ingresos if ingresos > 0 else None
-    mensual = datos.groupby("mes")[["venta_neta", "utilidad_bruta"]].sum().reindex(meses, fill_value=0)
-    # Un mes sin ventas tiene margen indefinido, no margen cero.
-    mensual["margen_pct"] = mensual["utilidad_bruta"].div(mensual["venta_neta"].replace(0, np.nan)).mul(100)
-    productos = datos.groupby("producto")["venta_neta"].sum().sort_values(ascending=False).head(5)
-    return {"ingresos": ingresos, "utilidad": utilidad, "margen": margen,
-            "registros": len(datos), "mensual": mensual, "productos": productos}
+ESTILOS = {
+    "background": "#F4F6FA",
+    "card": "#FFFFFF",
+    "text": "#202938",
+    "blue": "#2563EB",
+    "red": "#DC2626",
+    "green": "#16A34A",
+}
 
-def construir_dashboard(datos, etiqueta="Todo el catálogo", meses=None):
-    if meses is None:
-        meses = MESES
-    periodo = f"{meses[0]:%Y-%m} a {meses[-1]:%Y-%m}"
-    if datos.empty:
-        fig = go.Figure()
-        fig.add_annotation(text="Sin datos para esta selección", showarrow=False)
-        fig.update_layout(template="plotly_white", title=etiqueta,
-                          xaxis_visible=False, yaxis_visible=False)
-        return fig
 
-    r = resumir(datos, meses)
-    # Millones en las tarjetas; COP completos disponibles en tablas y hover.
-    indicadores = [
-        ("Ventas netas · millones COP", r["ingresos"] / 1e6, ".1f", ""),
-        ("Utilidad bruta · millones COP", r["utilidad"] / 1e6, ".1f", ""),
-        ("Margen bruto", r["margen"], ".1f", "%"),
-        ("Ventas registradas", r["registros"], ",.0f", "")
-    ]
+def obtener_datos(servicio, periodo):
+    ahora = datetime.now(timezone.utc)
 
-    graficos = []
-    for col, (titulo, valor, formato, sufijo) in enumerate(indicadores, 1):
-        graficos.append(go.Figure(go.Indicator(
-            mode="number", value=valor,
-            title={"text": titulo, "font": {"size": 13}},
-            number={"valueformat": formato, "suffix": sufijo, "font": {"size": 31}})))
-    m = r["mensual"]
-    fig_ventas = px.line(
-        m,
-        x=m.index,
-        y="venta_neta",
-        markers=True,
-        title="Ventas por mes",
-        color_discrete_sequence=["#007F5F"],
-        labels={"x": "Mes", "venta_neta": "Ventas netas (COP)"},
+    horas = {
+        "1": 1,
+        "3": 3,
+        "24": 24,
+    }
+
+    fecha_inicio = ahora - timedelta(hours=horas[periodo])
+
+    consulta = text("""
+        SELECT
+            ts,
+            svc,
+            status_code,
+            duration
+        FROM logs
+        WHERE ts >= :fecha_inicio
+          AND ts <= :fecha_final
+          AND (:servicio = 'Todos' OR svc = :servicio)
+        ORDER BY ts
+    """)
+
+    with engine.connect() as conexion:
+        df = pd.read_sql(
+            consulta,
+            conexion,
+            params={
+                "fecha_inicio": fecha_inicio,
+                "fecha_final": ahora,
+                "servicio": servicio,
+            },
+        )
+
+    return df
+
+
+def crear_tarjeta(titulo, valor, unidad="", color=None):
+    return html.Div(
+        [
+            html.P(titulo, style={
+                "color": "#64748B",
+                "fontSize": "14px",
+                "marginBottom": "8px",
+            }),
+            html.H2(
+                f"{valor} {unidad}",
+                style={
+                    "color": color or ESTILOS["text"],
+                    "fontSize": "27px",
+                    "margin": "0",
+                },
+            ),
+        ],
+        style={
+            "backgroundColor": "white",
+            "padding": "22px",
+            "borderRadius": "12px",
+            "boxShadow": "0 2px 8px rgba(0,0,0,0.06)",
+        },
     )
-    fig_ventas.update_traces(
-        line_width=3,
-        name="Ventas netas",
-        hovertemplate="%{x|%Y-%m}<br>Ventas: %{y:,.0f} COP<extra></extra>",
-    )
-    graficos.append(fig_ventas)
-
-    fig_margen = px.line(
-        m,
-        x=m.index,
-        y="margen_pct",
-        markers=True,
-        title="Margen bruto por mes",
-        color_discrete_sequence=["#8052A3"],
-        labels={"x": "Mes", "margen_pct": "Margen (%)"},
-    )
-    fig_margen.update_traces(
-        line_width=3,
-        name="Margen bruto",
-        hovertemplate="%{x|%Y-%m}<br>Margen: %{y:.2f}%<extra></extra>",
-    )
-    graficos.append(fig_margen)
-
-    productos = r["productos"].sort_values()
-    fig_ventas_producto = px.bar(
-        productos,
-        x='venta_neta',
-        y=productos.index,
-        title="Cinco productos con mayores ventas",
-        color_discrete_sequence=["#1677A5"],
-        labels={"venta_neta": "Ventas Netas (COP)", 'y': 'Producto'},
-    )
-    fig_ventas_producto.update_traces(
-        name="Ventas por producto",
-        hovertemplate="%{y}<br>Ventas: %{x:,.0f} COP<extra></extra>",
-    )
-    graficos.append(fig_ventas_producto)
 
 
-    max_ventas = ventas.groupby("mes")["venta_neta"].sum().max()
-    max_producto = ventas.groupby("producto")["venta_neta"].sum().max()
-    graficos.append(f"Conecta | {etiqueta} {periodo} · Datos simulados · Valores sin IVA")
-    return graficos
+app.layout = html.Div(
+    [
+        html.H1(
+            "Monitor de Servicios",
+            style={"color": "#1E293B"},
+        ),
 
-app.layout = html.Div(children=[
-    html.H1(children='Dashboard Ventas'),
-    html.Br(),
-    html.Hr(),
-    dcc.Dropdown(CANALES, 'Todos', id='dropdown-canales'),
-    html.Br(),
-    html.Div(children=[
-      dcc.RangeSlider(
-          min=0,
-          max=len(MESES) - 1,
-          value=(0, len(MESES) - 1),
-          marks={
-            index: mes.strftime("%Y-%m") for index, mes in enumerate(MESES)
-          },
-          allow_direct_input=False,
-          id='slider-rango'
-      )
-    ]),
-    html.Hr(),
-    html.H3(id='titulo', style={ 'text-align': 'center' }),
-    html.Div(children=[
-      dcc.Graph(id='ventas-netas', style={ 'width': '25%'}),
-      dcc.Graph(id='utilidad-bruta', style={ 'width': '25%'}),
-      dcc.Graph(id='margen-bruto', style={ 'width': '25%'}),
-      dcc.Graph(id='ventas-registradas', style={ 'width': '25%'}),
-    ], style={ 'display':'flex', 'flex-direction': 'row', 'height': '100px', 'justify-content': 'space-around'}),
-    html.Div(children=[
-        dcc.Graph(id='ventas-mes'),
-        dcc.Graph(id='margen-bruto-pct'),
-    ], style={ 'display':'flex', 'flex-direction': 'row', 'justify-content': 'space-around'}),
-    html.Div(children=[
-        dcc.Graph(id='ventas-por-producto')
-    ])
-])
+        html.P(
+            "Monitoreo de rendimiento y errores de PostgreSQL",
+            style={"color": "#64748B"},
+        ),
+
+        html.Div(
+            [
+                html.Div([
+                    html.Label("Seleccionar servicio"),
+                    dcc.Dropdown(
+                        id="servicio",
+                        options=[
+                            {"label": "Todos los servicios", "value": "Todos"},
+                            {"label": "Catalog", "value": "catalog"},
+                            {"label": "Checkout", "value": "checkout"},
+                            {"label": "Users", "value": "users"},
+                            {"label": "Auth", "value": "auth"},
+                            {"label": "Payments", "value": "payments"},
+                        ],
+                        value="Todos",
+                        clearable=False,
+                    ),
+                ], style={"width": "48%"}),
+
+                html.Div([
+                    html.Label("Período de consulta"),
+                    dcc.Dropdown(
+                        id="periodo",
+                        options=[
+                            {"label": "Última hora", "value": "1"},
+                            {"label": "Últimas 3 horas", "value": "3"},
+                            {"label": "Últimas 24 horas", "value": "24"},
+                        ],
+                        value="1",
+                        clearable=False,
+                    ),
+                ], style={"width": "48%"}),
+            ],
+            style={
+                "display": "flex",
+                "gap": "20px",
+                "marginBottom": "25px",
+            },
+        ),
+
+        html.Div(
+            id="indicadores",
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "repeat(5, 1fr)",
+                "gap": "15px",
+                "marginBottom": "25px",
+            },
+        ),
+
+        html.Div(
+            [
+                html.Div([
+                    html.H3("Tiempo de respuesta"),
+                    dcc.Graph(id="grafico-tiempo"),
+                ], style={
+                    "backgroundColor": "white",
+                    "padding": "15px",
+                    "borderRadius": "12px",
+                }),
+
+                html.Div([
+                    html.H3("Códigos HTTP"),
+                    dcc.Graph(id="grafico-errores"),
+                ], style={
+                    "backgroundColor": "white",
+                    "padding": "15px",
+                    "borderRadius": "12px",
+                }),
+            ],
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "1fr 1fr",
+                "gap": "20px",
+            },
+        ),
+
+        html.Div(
+            [
+                html.Label("Frecuencia de actualización"),
+                dcc.Dropdown(
+                    id="frecuencia",
+                    options=[
+                        {"label": "Cada 10 segundos", "value": 10000},
+                        {"label": "Cada 60 segundos", "value": 60000},
+                    ],
+                    value=10000,
+                    clearable=False,
+                    style={"maxWidth": "300px"},
+                ),
+            ],
+            style={"marginTop": "25px"},
+        ),
+
+        dcc.Interval(
+            id="actualizacion",
+            interval=10000,
+            n_intervals=0,
+        ),
+
+        html.Div(id="ultima-actualizacion"),
+
+    ],
+    style={
+        "backgroundColor": ESTILOS["background"],
+        "minHeight": "100vh",
+        "padding": "30px",
+        "fontFamily": "Arial",
+    },
+)
+
 
 @callback(
-  Output('ventas-netas', 'figure'),
-  Output('utilidad-bruta', 'figure'),
-  Output('margen-bruto', 'figure'),
-  Output('ventas-registradas', 'figure'),
-  Output('ventas-mes', 'figure'),
-  Output('margen-bruto-pct', 'figure'),
-  Output('ventas-por-producto', 'figure'),
-  Output('titulo', 'children'),
-
-  Input('dropdown-canales', 'value'),
-  Input('slider-rango', 'value')
+    Output("actualizacion", "interval"),
+    Input("frecuencia", "value"),
 )
-def actualizar_vista(canal, rango):
-    index_inicio, index_fin = rango
-    inicio = MESES[index_inicio]
-    fin = MESES[index_fin]
-    seleccion = filtrar(ventas, canal, inicio, fin)
-    meses = pd.date_range(inicio, fin, freq="MS")
-    print(f"Canal: {canal} | Desde {inicio:%Y-%m} hasta {fin:%Y-%m}, ambos incluidos")
-    if seleccion.empty:
-        print("No hay ventas en esta selección.")
-        return
-    return construir_dashboard(seleccion, f"Canal: {canal}", meses)
+def cambiar_frecuencia(frecuencia):
+    return frecuencia
 
 
-if __name__ == '__main__':
-  app.run(debug=True)
+@callback(
+    Output("indicadores", "children"),
+    Output("grafico-tiempo", "figure"),
+    Output("grafico-errores", "figure"),
+    Output("ultima-actualizacion", "children"),
+    Input("servicio", "value"),
+    Input("periodo", "value"),
+    Input("actualizacion", "n_intervals"),
+)
+def actualizar_dashboard(servicio, periodo, n_intervals):
+
+    try:
+        df = obtener_datos(servicio, periodo)
+
+        if df.empty:
+            vacio = go.Figure()
+            vacio.update_layout(
+                title="No hay registros en el período seleccionado"
+            )
+
+            return (
+                [crear_tarjeta("Registros", "0")],
+                vacio,
+                vacio,
+                "Sin datos para mostrar",
+            )
+
+        total = len(df)
+
+        promedio = round(df["duration"].mean(), 2)
+        p95 = round(df["duration"].quantile(0.95), 2)
+        p99 = round(df["duration"].quantile(0.99), 2)
+
+        errores_4xx = int(
+            df["status_code"].between(400, 499).sum()
+        )
+
+        errores_5xx = int(
+            df["status_code"].between(500, 599).sum()
+        )
+
+        errores = errores_4xx + errores_5xx
+
+        minutos_periodo = int(periodo) * 60
+
+        rpm = round(total / minutos_periodo, 2)
+
+        indicadores = [
+            crear_tarjeta("Response Time", promedio, "ms"),
+            crear_tarjeta("Throughput", rpm, "RPM"),
+            crear_tarjeta("Error Count", errores, "", "#DC2626"),
+            crear_tarjeta("P95", p95, "ms"),
+            crear_tarjeta("P99", p99, "ms"),
+        ]
+
+        grafico_tiempo = px.line(
+            df,
+            x="ts",
+            y="duration",
+            title="Evolución del tiempo de respuesta",
+            labels={
+                "ts": "Fecha y hora",
+                "duration": "Duración (ms)",
+            },
+        )
+
+        grafico_tiempo.update_layout(
+            template="plotly_white",
+            hovermode="x unified",
+        )
+
+        estados = (
+            df.groupby("status_code")
+            .size()
+            .reset_index(name="cantidad")
+        )
+
+        # Clasificar los códigos HTTP por categoría
+        estados["categoria"] = estados["status_code"].apply(
+            lambda codigo:
+                "Éxito (2xx)" if 200 <= codigo <= 299
+                else "Error del cliente (4xx)" if 400 <= codigo <= 499
+                else "Error del servidor (5xx)" if 500 <= codigo <= 599
+                else "Otros"
+        )
+
+        grafico_errores = px.bar(
+            estados,
+            x="status_code",
+            y="cantidad",
+            color="categoria",
+            title="Distribución de solicitudes por código HTTP",
+            labels={
+                "status_code": "Código HTTP",
+                "cantidad": "Número de solicitudes",
+                "categoria": "Categoría",
+            },
+            color_discrete_map={
+                "Éxito (2xx)": "#16A34A",
+                "Error del cliente (4xx)": "#F59E0B",
+                "Error del servidor (5xx)": "#DC2626",
+                "Otros": "#64748B",
+            },
+        )
+
+        grafico_errores.update_layout(
+            template="plotly_white",
+            showlegend=True,
+            xaxis_title="Código HTTP",
+            yaxis_title="Número de solicitudes",
+        )
+
+        hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+        return (
+            indicadores,
+            grafico_tiempo,
+            grafico_errores,
+            f"Última actualización: {hora}",
+        )
+
+    except Exception as error:
+        vacio = go.Figure()
+        vacio.update_layout(title="Error al consultar los datos")
+
+        return (
+            [crear_tarjeta("Estado", "Error", color="#DC2626")],
+            vacio,
+            vacio,
+            f"No se pudo actualizar el dashboard: {error}",
+        )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
